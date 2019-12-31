@@ -19,6 +19,12 @@
  * Button10 = LED5
  */
 
+#include <ssidinfo.h>
+
+
+//MQTT
+//#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 
 #include <Wire.h>
 #include <Adafruit_ADS1015.h>
@@ -34,21 +40,31 @@
 #define SCL_PIN 5
 
 #define RANDOMLOOPTIME 2000 //2s
-#define GAMETIMEWAITFORBUTTON 20000 //20s
+#define GAMETIMEWAITFORBUTTON 30000 //20s
 
 Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
 Adafruit_MCP23017 mcp0;
 Adafruit_MCP23017 mcp4;
 
-const char* ssid = "**;
-const char* password = "**";
+const char* ssid = SSID_NAME;
+const char* password = SSID_PASS;
+const char* mqtt_server = MQTT_SERVER;
+
+const char* mqtt_potmeter_0 = "/speeldoos/ads1"; //ADS1115 0
+const char* mqtt_potmeter_1 = "/speeldoos/ads2"; //ADS1115 1
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+char mqttMsg[50];
 
 int16_t mcp0GPIO, mcp4GPIO;
-int16_t adsresult0, adsresult1;
+int16_t adsresult0, adsresult0_old, adsresult1, adsresult1_old;
 
 byte target;
 byte target_button_status;
 unsigned long gameStartTime;
+
+
 
 // Look Up Table  {button,led}
 byte lut[][2] = { {7,8}, //Button 1
@@ -61,19 +77,39 @@ byte lut[][2] = { {7,8}, //Button 1
                   {1,14}, //Micro button links
                   {2,13}, //Micro button rechts
                   {8,7} };  //Switch left
-                 
-void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
+
+                  
+ void setupWifi() {
+
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  randomSeed(micros());
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
 
   //OTA
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.println("Connection Failed! Rebooting...");
-    delay(5000);
-    ESP.restart();
-  }
+  
+  //WiFi.begin(ssid, password);
+//  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+//    Serial.println("Connection Failed! Rebooting...");
+//    delay(5000);
+//    ESP.restart();
+//  }
 
   // Port defaults to 8266
   // ArduinoOTA.setPort(8266);
@@ -105,7 +141,55 @@ void setup() {
   Serial.println("Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+}
 
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+
+  // Switch on the LED if an 1 was received as first character
+  //if ((char)payload[0] == '1') {
+   
+  //}
+
+}
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      client.publish("outTopic", "hello world");
+      // ... and resubscribe
+      client.subscribe("inTopic");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+                
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  setupWifi(); //All wifi stuff
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  
  //SETUP Speeldoos
   Wire.begin(SDA_PIN,SCL_PIN);
   ads.begin();        // only 1 ADS115
@@ -197,6 +281,10 @@ void startGame(){
 
 void loop() {
   ArduinoOTA.handle();
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
   
   // put your main code here, to run repeatedly:
   //mcp0GPIO = mcp0.readGPIOAB();
@@ -205,8 +293,23 @@ void loop() {
   //Serial.print("mcp0GPIO: "); Serial.println(mcp0GPIO);
 
 // ADS1115 draaiknopjes, connected op ADS0 en ADS1 (single ended)
+  adsresult0_old = adsresult0;
+  adsresult1_old = adsresult1;
   adsresult0 = ads.readADC_SingleEnded(0);
   adsresult1 = ads.readADC_SingleEnded(1);
+
+  if (adsresult0 != adsresult0_old){
+    snprintf (mqttMsg, 50, "%d", adsresult0);
+    Serial.print("Publish message: ");
+    Serial.println(mqttMsg);
+    client.publish(mqtt_potmeter_0, mqttMsg);
+  }
+  if (adsresult1 != adsresult1_old){
+    snprintf (mqttMsg, 50, "%d", adsresult1);
+    Serial.print("Publish message: ");
+    Serial.println(mqttMsg);
+    client.publish(mqtt_potmeter_1, mqttMsg);
+  }
   //Serial.print("ads0: "); Serial.println(adsresult0);
   //Serial.print("ads1: "); Serial.println(adsresult1);
   
@@ -222,5 +325,7 @@ void loop() {
     //timer passed
     startGame();
   }
+
+  
   
 }
