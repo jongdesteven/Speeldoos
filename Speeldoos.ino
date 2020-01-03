@@ -39,12 +39,37 @@
 #define SDA_PIN 4
 #define SCL_PIN 5
 
+#define ADS_FILTER 0.1
+
 #define RANDOMLOOPTIME 2000 //2s
-#define GAMETIMEWAITFORBUTTON 30000 //20s
+#define RANDOMLOOPLEDSPEED 50
+#define GAMETIMEWAITFORBUTTON 30000 //30s
+#define IDLETIMEOUT 120000 //2min
+#define IDLEDELAY 3000 //3s
+
+//program state
+#define GAMEPUSHME    1
+#define OFFSTATE      2
+
+//Game Push Me
+#define PUSHMESTART         1
+#define PUSHMERANDOMLIGHTS  2
+#define PUSHMEWAIT          3
+
+//Random Lights
+#define RANDOMLIGHTSSTART 1
+#define RANDOMLIGHTSBLINK 2
+
+//Send debug messages via MQTT
+#define DEBUG 1
 
 Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
 Adafruit_MCP23017 mcp0;
 Adafruit_MCP23017 mcp4;
+
+int programState;
+int pushMeState;
+int randomlightState;
 
 const char* ssid = SSID_NAME;
 const char* password = SSID_PASS;
@@ -52,19 +77,26 @@ const char* mqtt_server = MQTT_SERVER;
 
 const char* mqtt_potmeter_0 = "/speeldoos/ads1"; //ADS1115 0
 const char* mqtt_potmeter_1 = "/speeldoos/ads2"; //ADS1115 1
+const char* mqtt_GPIO_0 = "/speeldoos/gpio1"; //MCP buttons
+const char* mqtt_GPIO_1 = "/speeldoos/gpio2"; //MCP LED
+const char* mqtt_debug = "/speeldoos/debug"; //MCP debug info
+const char* mqtt_reaction_time = "/speeldoos/pushmereactiontime";
+const char* mqtt_button_prefix = "/speeldoos/button/";
+const char* mqtt_led_prefix = "/speeldoos/led/";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-char mqttMsg[50];
+char mqttMsg[250];
+char debugmsg[250];
 
-int16_t mcp0GPIO, mcp4GPIO;
+int16_t mcp0GPIO, mcp0GPIO_old, mcp4GPIO, mcp4GPIO_old;
 int16_t adsresult0, adsresult0_old, adsresult1, adsresult1_old;
 
 byte target;
 byte target_button_status;
 unsigned long gameStartTime;
-
-
+unsigned long lastButtonPressTime;
+unsigned long randomLightsStartTime;
 
 // Look Up Table  {button,led}
 byte lut[][2] = { {7,8}, //Button 1
@@ -77,36 +109,29 @@ byte lut[][2] = { {7,8}, //Button 1
                   {1,14}, //Micro button links
                   {2,13}, //Micro button rechts
                   {8,7} };  //Switch left
-
-                  
+                 
  void setupWifi() {
 
   delay(10);
   // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+  //mqttDebug(ssid);
   WiFi.mode(WIFI_STA);
   
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
 
   randomSeed(micros());
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
+  sprintf(debugmsg, "WiFi Connected to: %s", ssid); mqttDebug(debugmsg);
+  //sprintf(debugmsg, "IP Address: %s", WiFi.localIP().toString()); mqttDebug(debugmsg);
   //OTA
   
   //WiFi.begin(ssid, password);
 //  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-//    Serial.println("Connection Failed! Rebooting...");
+//    mqttDebug("Connection Failed! Rebooting...");
 //    delay(5000);
 //    ESP.restart();
 //  }
@@ -121,36 +146,34 @@ byte lut[][2] = { {7,8}, //Button 1
   ArduinoOTA.setHostname("speeldoos");
 
   ArduinoOTA.onStart([]() {
-    Serial.println("Start");
+    mqttDebug("OTA Start");
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    mqttDebug("OTA end, restarting...");
+    ESP.restart(); //test if this works..
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    sprintf(debugmsg, "OTA progress: %u", (progress / (total / 100))); mqttDebug(debugmsg);
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    //Serial.printf("Error[%u]: ", error);
+    sprintf(debugmsg, "OTA Error[%u]: ", error); mqttDebug(debugmsg);
+    if (error == OTA_AUTH_ERROR) mqttDebug("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) mqttDebug("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) mqttDebug("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) mqttDebug("Receive Failed");
+    else if (error == OTA_END_ERROR) mqttDebug("End Failed");
   });
   ArduinoOTA.begin();
-  Serial.println("Ready");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  mqttDebug("OTA Ready");
+  ////Serial.print("IP address: ");
+  //mqttDebug(WiFi.localIP());
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
   for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+    ////Serial.print((char)payload[i]);
   }
-  Serial.println();
 
   // Switch on the LED if an 1 was received as first character
   //if ((char)payload[0] == '1') {
@@ -162,21 +185,21 @@ void callback(char* topic, byte* payload, unsigned int length) {
 void reconnect() {
   // Loop until we're reconnected
   while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
+    ////Serial.print("Attempting MQTT connection...");
     // Create a random client ID
     String clientId = "ESP8266Client-";
     clientId += String(random(0xffff), HEX);
     // Attempt to connect
     if (client.connect(clientId.c_str())) {
-      Serial.println("connected");
+      mqttDebug("MQTT connected");
       // Once connected, publish an announcement...
-      client.publish("outTopic", "hello world");
+      //client.publish("outTopic", "hello world");
       // ... and resubscribe
-      client.subscribe("inTopic");
+      //client.subscribe("inTopic");
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
+      ////Serial.print("failed, rc=");
+      ////Serial.print(client.state());
+      mqttDebug(" try again in 5 seconds");
       // Wait 5 seconds before retrying
       delay(5000);
     }
@@ -184,8 +207,12 @@ void reconnect() {
 }
                 
 void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
+  //define the beginstates;
+  programState = GAMEPUSHME;
+  randomlightState = RANDOMLIGHTSSTART;
+  pushMeState = PUSHMERANDOMLIGHTS;
+  
+  //Serial.begin(115200);
   setupWifi(); //All wifi stuff
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
@@ -251,81 +278,200 @@ void setup() {
   
 }
 
-void randomLights()
-{
+//Debugging over MQTT
+void mqttDebug(String message){
+  if (DEBUG){
+    char msg[250];
+    message.toCharArray(msg,250);
+    //publish sensor data to MQTT broker
+    client.publish(mqtt_debug, msg);
+  }
+}
+
+//show random lights and return 1 if done
+int randomLights() {
   // run through random lights with certain delay
-  long start = millis();
-
-  while (millis()-start <= RANDOMLOOPTIME){
-    target = random(10);
-    delay(int(adsresult0/100));
-    mcp4.writeGPIOAB(1<<lut[target][1]);
-    //mcp4.digitalWrite(lut[target][1], HIGH);
+  switch (randomlightState) {
+  case RANDOMLIGHTSSTART:
+    randomLightsStartTime = millis();
+    randomlightState = RANDOMLIGHTSBLINK;
+    break;
+  case RANDOMLIGHTSBLINK:
+    if (millis()-randomLightsStartTime >= RANDOMLOOPLEDSPEED){ //Change LED when time is passed
+      target = random(10);
+      mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding light.
+    }
+    break;
+  default:
+    break;
   }
- 
+  
+  // Check if we need to continue
+  if (millis()-randomLightsStartTime >= RANDOMLOOPTIME){
+    randomlightState = RANDOMLIGHTSSTART; //next time start
+    return 1;
+  }
+  else {
+    return 0;
+  }
 }
 
-void startGame(){
-  randomLights(); //run random lights to start
-  target = random(10); //randomize button
-  gameStartTime = millis();
-  mcp4.writeGPIOAB(1<<lut[target][1]); //turn on only corresponding LED
-  if ( mcp0.digitalRead(lut[target][0]) == HIGH){ //check current status and save opposite
-    target_button_status = LOW;
-  }
-  else { 
-    target_button_status = HIGH;
-  }
-  Serial.print("Target: "); Serial.print(target); Serial.print(" to: "); Serial.println(target_button_status);
-}
-
-void loop() {
-  ArduinoOTA.handle();
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
+void sendMQTTUpdates(){
+  // Send MQTT statuses
+  byte button_status;
+  String topic;
   
-  // put your main code here, to run repeatedly:
-  //mcp0GPIO = mcp0.readGPIOAB();
-  //mcp4GPIO = mcp4.readGPIOAB();
+  if (mcp0GPIO != mcp0GPIO_old){  
+    //Send On/Off to specific button topic.
+    for (int i = 0; i < sizeof(lut)/2; i++) {
+      String topic_prefix = mqtt_button_prefix; //two step string build needed
+      topic = topic_prefix + i;
+      if ((mcp0GPIO^mcp0GPIO_old) & 1<<lut[i][0]){ //Check if specific button is changed
+        byte button_status = (mcp0GPIO&(1<<lut[i][0])) >> lut[i][0];
+        if (button_status == LOW) client.publish(topic.c_str(), "ON");
+        else client.publish(topic.c_str(), "OFF");   
+      }                
+    }
+  }
   
-  //Serial.print("mcp0GPIO: "); Serial.println(mcp0GPIO);
-
-// ADS1115 draaiknopjes, connected op ADS0 en ADS1 (single ended)
-  adsresult0_old = adsresult0;
-  adsresult1_old = adsresult1;
-  adsresult0 = ads.readADC_SingleEnded(0);
-  adsresult1 = ads.readADC_SingleEnded(1);
-
+  if (mcp4GPIO != mcp4GPIO_old){
+    snprintf (mqttMsg, 250, "%d", mcp4GPIO);
+    client.publish(mqtt_GPIO_1, mqttMsg);
+  }
   if (adsresult0 != adsresult0_old){
-    snprintf (mqttMsg, 50, "%d", adsresult0);
-    Serial.print("Publish message: ");
-    Serial.println(mqttMsg);
+    snprintf (mqttMsg, 250, "%d", adsresult0);
     client.publish(mqtt_potmeter_0, mqttMsg);
   }
   if (adsresult1 != adsresult1_old){
-    snprintf (mqttMsg, 50, "%d", adsresult1);
-    Serial.print("Publish message: ");
-    Serial.println(mqttMsg);
+    snprintf (mqttMsg, 250, "%d", adsresult1);
     client.publish(mqtt_potmeter_1, mqttMsg);
   }
-  //Serial.print("ads0: "); Serial.println(adsresult0);
-  //Serial.print("ads1: "); Serial.println(adsresult1);
-  
-  
-  //while in game:
-  if ( millis() - gameStartTime <= GAMETIMEWAITFORBUTTON){
-    if (mcp0.digitalRead(lut[target][0]) == target_button_status){
-      // correct button set to desired position
-      startGame(); //start new game
-    }
+}
+
+//Read and write User interface and send updates over MQTT
+int updateInputStatus(){
+  // Read Buttons
+  mcp0GPIO_old = mcp0GPIO;
+  mcp0GPIO = mcp0.readGPIOAB(); // read button status
+  mcp4.writeGPIOAB(mcp4GPIO);   // write to LEDs
+  //mcp4GPIO = mcp4.readGPIOAB(); // I believe they are the same...
+
+  // ADS1115 draaiknopjes, connected op ADS0 en ADS1 (single ended)
+  adsresult0_old = adsresult0;
+  adsresult1_old = adsresult1;
+  adsresult0 = int( ((adsresult0_old*(1-ADS_FILTER)) + (ads.readADC_SingleEnded(0)*ADS_FILTER))/17.5 ); //Some sort of filtering
+  adsresult1 = int( ((adsresult1_old*(1-ADS_FILTER)) + (ads.readADC_SingleEnded(1)*ADS_FILTER))/17.5 );
+
+  //if a button has been pressed, reset timeout timer
+  if (mcp0GPIO != mcp0GPIO_old){
+    lastButtonPressTime = millis();
+    mqttDebug("updateinput: button changed");
+    return 1;
   }
   else {
-    //timer passed
-    startGame();
+    return 0; // no button presses
   }
+}
 
+void gamePushMe(){
+  //while in game
   
+  switch (pushMeState) {
+  case PUSHMERANDOMLIGHTS:
+    if (randomLights()) {
+      pushMeState = PUSHMESTART; //loop is done and continue
+      mqttDebug("PUSHMERANDOMLIGHTS: loop done go to PUSHMESTART");
+    }
+    break;
+    
+  case PUSHMESTART: //Start up new Game
+    target = random(10); //randomize button
+    gameStartTime = millis();
+    mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding LED
+    mqttDebug("PUSHMESTART: begin");
+    if ( (mcp0GPIO&(1<<lut[target][0])) >> lut[target][0] == HIGH){ //check current status and save opposite
+      target_button_status = LOW;
+    }
+    else { 
+      target_button_status = HIGH;
+    }
+    
+    //Start waiting game
+    pushMeState = PUSHMEWAIT; //Go to next state
+    mqttDebug("PUSHMESTART: go to PUSHMEWAIT");
+
+    break;
+    
+  case PUSHMEWAIT: //Wait for button
+    if ( millis() - gameStartTime <= GAMETIMEWAITFORBUTTON){
+      if ((mcp0GPIO&(1<<lut[target][0])) >>lut[target][0] == target_button_status){
+        // correct button set to desired position
+        pushMeState = PUSHMERANDOMLIGHTS; //start new game
+        //mqttDebug("PUSHMEWAIT: button pressed ");
+        sprintf(debugmsg, "PUSHMEWAIT: button pressed after %d ms", (millis() - gameStartTime) ); mqttDebug(debugmsg);
+        snprintf (mqttMsg, 50, "%d", (millis() - gameStartTime));
+        client.publish(mqtt_reaction_time, mqttMsg);
+      }
+    }
+    else {
+      //timer passed
+        pushMeState = PUSHMERANDOMLIGHTS; //start new game
+        mqttDebug("PUSHMEWAIT: timer passed");
+    }
+    break;
+    
+  default:
+    // statements
+    break;
+  }
+}
+
+void loop() {
+  int buttonsChanged;
+  
+  buttonsChanged = updateInputStatus(); //Read and write once per loop
+  
+  //Only use wifi when not in OFFSTATE
+  if (programState != OFFSTATE){
+     // OTA handles
+    ArduinoOTA.handle();
+    if (!client.connected()) {
+      reconnect();
+    }
+    client.loop();
+    sendMQTTUpdates();
+  }
+  
+  mcp4GPIO_old = mcp4GPIO; // update old value because we update LEDs in software, but we use in mqtt sending
+  
+  switch (programState) {
+  case GAMEPUSHME:
+    // statements
+    gamePushMe();
+    break;
+  case OFFSTATE:
+    mcp4GPIO = 0; // All LED off
+    //wifi_set_sleep_type(MODEM_SLEEP_T) // Modem off
+    if (buttonsChanged) {
+      mqttDebug("OFFSTATE: buttonschanged");
+      pushMeState = PUSHMERANDOMLIGHTS; //start new game with lights
+      programState = GAMEPUSHME;
+    }
+    else {
+      //mqttDebug("OFFSTATE: delay start");
+      delay(IDLEDELAY);
+      //mqttDebug("OFFSTATE: delay end");
+    }
+    break;
+  default:
+    // statements
+    break;
+  }
+  
+  // timeout timer
+  if ( (millis() - lastButtonPressTime) >= IDLETIMEOUT  && programState != OFFSTATE){
+    programState = OFFSTATE;
+    mqttDebug("Last button press timeout");
+  }
   
 }
