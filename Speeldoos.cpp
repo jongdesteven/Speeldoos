@@ -19,15 +19,17 @@
  * Button10 = LED5
  */
 
-#include <ssidinfo.h>
-
-
+#include "ssidinfo.h"
+#include <EEPROM.h>
 //MQTT
 //#include <ESP8266WiFi.h>
+#include <Arduino.h>
 #include <PubSubClient.h>
 
 #include <Wire.h>
-#include <Adafruit_ADS1015.h>
+//#include <Adafruit_ADS1015.h>
+#include "ADS1X15.h"
+
 #include "Adafruit_MCP23017.h"
 
 //OTA
@@ -46,6 +48,7 @@
 #define GAMETIMEWAITFORBUTTON 30000 //30s
 #define IDLETIMEOUT 120000 //2min
 #define IDLEDELAY 3000 //3s
+#define UPDATESPEED 100 //100ms
 
 //program state
 #define GAMEPUSHME    1
@@ -63,7 +66,8 @@
 //Send debug messages via MQTT
 #define DEBUG 1
 
-Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
+//Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
+ADS1115 ADS(0x48);
 Adafruit_MCP23017 mcp0;
 Adafruit_MCP23017 mcp4;
 
@@ -89,16 +93,18 @@ PubSubClient client(espClient);
 char mqttMsg[250];
 char debugmsg[250];
 
-int16_t mcp0GPIO, mcp0GPIO_old, mcp4GPIO, mcp4GPIO_old;
-int16_t adsresult0, adsresult0_old, adsresult1, adsresult1_old;
+int16_t mcp0GPIO, mcp0GPIO_old, mcp4GPIO, mcp4GPIO_old = 0;
+int16_t adsresult0, adsresult0_old, adsresult1, adsresult1_old = 0;
 
 byte target;
 byte target_button_status;
-unsigned long gameStartTime;
-unsigned long lastButtonPressTime;
-unsigned long randomLightsStartTime;
+unsigned long gameStartTime = 0;
+unsigned long lastButtonPressTime = 0;
+unsigned long randomLightsStartTime = 0;
+unsigned long randomLightLastChangeTime = 0;
+unsigned long lastUpdateSentTime = 0;
 
-// Look Up Table  {button,led}
+// Look Up Table  {button,led} //vibra motor pin A5=11
 byte lut[][2] = { {7,8}, //Button 1
                   {6,9}, //Button 2
                   {5,10}, //Button 3
@@ -109,12 +115,23 @@ byte lut[][2] = { {7,8}, //Button 1
                   {1,14}, //Micro button links
                   {2,13}, //Micro button rechts
                   {8,7} };  //Switch left
+
+void setupWifi();
+void callback(char* topic, byte* payload, unsigned int length);
+void reconnect();
+int randomLights();
+void mqttDebug(String message);
+void sendMQTTUpdates();
+int updateInputStatus();
+void gamePushMe();
+void goDeepSleep();
                  
- void setupWifi() {
+void setupWifi() {
 
   delay(10);
   // We start by connecting to a WiFi network
   //mqttDebug(ssid);
+
   WiFi.mode(WIFI_STA);
   
   WiFi.begin(ssid, password);
@@ -166,6 +183,9 @@ byte lut[][2] = { {7,8}, //Button 1
   });
   ArduinoOTA.begin();
   mqttDebug("OTA Ready");
+
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
   ////Serial.print("IP address: ");
   //mqttDebug(WiFi.localIP());
 }
@@ -205,23 +225,181 @@ void reconnect() {
     }
   }
 }
-                
+
+//Debugging over MQTT
+void mqttDebug(String message){
+  if (DEBUG){
+    char msg[250];
+    message.toCharArray(msg,250);
+    //publish sensor data to MQTT broker
+    client.publish(mqtt_debug, msg);
+  }
+}
+
+//show random lights and return 1 if done
+int randomLights() {
+  // run through random lights with certain delay
+  switch (randomlightState) {
+  case RANDOMLIGHTSSTART:
+    randomLightsStartTime = millis();
+    randomLightLastChangeTime = randomLightsStartTime;
+    randomlightState = RANDOMLIGHTSBLINK;
+    break;
+  case RANDOMLIGHTSBLINK:
+    if (millis()-randomLightLastChangeTime >= RANDOMLOOPLEDSPEED){ //Change LED when time is passed
+      target = random(10);
+      mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding light.
+      randomLightLastChangeTime = millis();
+    }
+    break;
+  default:
+    break;
+  }
+  
+  // Check if we need to continue
+  if (millis()-randomLightsStartTime >= RANDOMLOOPTIME){
+    randomlightState = RANDOMLIGHTSSTART; //next time start
+    return 1;
+  }
+  else {
+    return 0;
+  }
+}
+             
+
+void sendMQTTUpdates(){
+  // Send MQTT statuses
+  String topic;
+  
+  if (mcp0GPIO != mcp0GPIO_old){  
+    //Send On/Off to specific button topic.
+    for (int i = 0; i < sizeof(lut)/2; i++) {
+      String topic_prefix = mqtt_button_prefix; //two step string build needed
+      topic = topic_prefix + i;
+      if ((mcp0GPIO^mcp0GPIO_old) & 1<<lut[i][0]){ //Check if specific button is changed
+        byte button_status = (mcp0GPIO&(1<<lut[i][0])) >> lut[i][0];
+        if (button_status == LOW) client.publish(topic.c_str(), "ON");
+        else client.publish(topic.c_str(), "OFF");   
+      }                
+    }
+  }
+  
+  if (mcp4GPIO != mcp4GPIO_old){
+    snprintf (mqttMsg, 250, "%d", mcp4GPIO);
+    client.publish(mqtt_GPIO_1, mqttMsg);
+  }
+
+  if (millis() - lastUpdateSentTime >= UPDATESPEED){
+    if (adsresult0 != adsresult0_old){
+      snprintf (mqttMsg, 250, "%d", adsresult0);
+      client.publish(mqtt_potmeter_0, mqttMsg);
+    }
+    if (adsresult1 != adsresult1_old){
+      snprintf (mqttMsg, 250, "%d", adsresult1);
+      client.publish(mqtt_potmeter_1, mqttMsg);
+    }
+    lastUpdateSentTime = millis();
+  }
+  
+}
+
+//Read and write User interface and send updates over MQTT
+int updateInputStatus(){
+  // Read Buttons
+  mcp0GPIO_old = mcp0GPIO;
+  mcp0GPIO = mcp0.readGPIOAB(); // read button status
+  mcp4.writeGPIOAB(mcp4GPIO);   // write to LEDs
+  //mcp4GPIO = mcp4.readGPIOAB(); // I believe they are the same...
+
+  // ADS1115 draaiknopjes, connected op ADS0 en ADS1 (single ended)
+  adsresult0_old = adsresult0;
+  adsresult1_old = adsresult1;
+  adsresult0 = int( (adsresult0_old*(1-ADS_FILTER)) + (ADS.readADC(0)*ADS_FILTER) ); //Some sort of filtering
+  adsresult1 = int( (adsresult1_old*(1-ADS_FILTER)) + (ADS.readADC(1)*ADS_FILTER) );
+
+  //if a button has been pressed, reset timeout timer
+  if(programState == OFFSTATE){
+    String text;
+    mqttDebug("UPDATEINPUT: Recovering buttons for OFFSTATE");
+    mcp0GPIO_old = EEPROM.read(0)<<8;
+    mcp0GPIO_old = mcp0GPIO_old+EEPROM.read(1);
+    text = "UPDATEINPUT: eepromMCP: "+String(mcp0GPIO_old, BIN);
+    mqttDebug(text);
+  }
+
+  if (mcp0GPIO != mcp0GPIO_old){
+    lastButtonPressTime = millis();
+    mqttDebug("UPDATEINPUT: button changed");
+    return 1;
+  }
+  else {
+    return 0; // no button presses
+  }
+}
+
+void gamePushMe(){
+  //while in game
+  
+  switch (pushMeState) {
+  case PUSHMERANDOMLIGHTS:
+    if (randomLights()) {
+      pushMeState = PUSHMESTART; //loop is done and continue
+      mqttDebug("PUSHMERANDOMLIGHTS: loop done go to PUSHMESTART");
+    }
+    break;
+    
+  case PUSHMESTART: //Start up new Game
+    target = random(10); //randomize button
+    gameStartTime = millis();
+    mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding LED
+    mqttDebug("PUSHMESTART: begin");
+    if ( (mcp0GPIO&(1<<lut[target][0])) >> lut[target][0] == HIGH){ //check current status and save opposite
+      target_button_status = LOW;
+    }
+    else { 
+      target_button_status = HIGH;
+    }
+    
+    //Start waiting game
+    pushMeState = PUSHMEWAIT; //Go to next state
+    mqttDebug("PUSHMESTART: go to PUSHMEWAIT");
+
+    break;
+    
+  case PUSHMEWAIT: //Wait for button
+    if ( millis() - gameStartTime <= GAMETIMEWAITFORBUTTON){
+      if ((mcp0GPIO&(1<<lut[target][0])) >>lut[target][0] == target_button_status){
+        // correct button set to desired position
+        pushMeState = PUSHMERANDOMLIGHTS; //start new game
+        //mqttDebug("PUSHMEWAIT: button pressed ");
+        sprintf(debugmsg, "PUSHMEWAIT: button pressed after %u ms", (millis() - gameStartTime) ); mqttDebug(debugmsg);
+        snprintf (mqttMsg, 50, "%u", (millis() - gameStartTime));
+        client.publish(mqtt_reaction_time, mqttMsg);
+      }
+    }
+    else {
+      //timer passed
+        pushMeState = PUSHMERANDOMLIGHTS; //start new game
+        mqttDebug("PUSHMEWAIT: timer passed");
+    }
+    break;
+  }
+}
+
 void setup() {
   //define the beginstates;
-  programState = GAMEPUSHME;
+  programState = OFFSTATE;
   randomlightState = RANDOMLIGHTSSTART;
   pushMeState = PUSHMERANDOMLIGHTS;
   
   //Serial.begin(115200);
-  setupWifi(); //All wifi stuff
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
+  EEPROM.begin(4);
   
- //SETUP Speeldoos
+  //SETUP Speeldoos
   Wire.begin(SDA_PIN,SCL_PIN);
-  ads.begin();        // only 1 ADS115
-  mcp0.begin(0);      // A0:A2 = Gnd
-  mcp4.begin(4);      // A0:A1 = Gnd A2 = VCC
+  ADS.begin();        // only 1 ADS115
+  mcp0.begin(0, &Wire);      // A0:A2 = Gnd
+  mcp4.begin(4, &Wire);      // A0:A1 = Gnd A2 = VCC
 
  // MCP buttons left side
   mcp0.pinMode(7+8, INPUT);
@@ -278,157 +456,34 @@ void setup() {
   
 }
 
-//Debugging over MQTT
-void mqttDebug(String message){
-  if (DEBUG){
-    char msg[250];
-    message.toCharArray(msg,250);
-    //publish sensor data to MQTT broker
-    client.publish(mqtt_debug, msg);
+void goDeepSleep(){
+  bool eepromChanges = false;
+  String text = "GODEEPSLEEP: ";
+  mcp4GPIO = 0; // All LED off
+  updateInputStatus();
+  // Save button state for after deepsleep
+  if ( (mcp0GPIO>>8) != EEPROM.read(0) ){
+    EEPROM.write(0, (mcp0GPIO>>8));
+    text = text + "eemprom1: "+String((mcp0GPIO>>8), BIN);
+    eepromChanges = true;
   }
-}
-
-//show random lights and return 1 if done
-int randomLights() {
-  // run through random lights with certain delay
-  switch (randomlightState) {
-  case RANDOMLIGHTSSTART:
-    randomLightsStartTime = millis();
-    randomlightState = RANDOMLIGHTSBLINK;
-    break;
-  case RANDOMLIGHTSBLINK:
-    if (millis()-randomLightsStartTime >= RANDOMLOOPLEDSPEED){ //Change LED when time is passed
-      target = random(10);
-      mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding light.
-    }
-    break;
-  default:
-    break;
+  if ( (byte)(mcp0GPIO&0x00FF) != EEPROM.read(1) ){
+    EEPROM.write(1, (mcp0GPIO&0x00FF));
+    text = text + " eeprom2: "+String((mcp0GPIO&0x00FF), BIN);
+    eepromChanges = true;
   }
-  
-  // Check if we need to continue
-  if (millis()-randomLightsStartTime >= RANDOMLOOPTIME){
-    randomlightState = RANDOMLIGHTSSTART; //next time start
-    return 1;
+  if (eepromChanges){
+    EEPROM.commit();
+    mqttDebug(text);
   }
-  else {
-    return 0;
-  }
-}
-
-void sendMQTTUpdates(){
-  // Send MQTT statuses
-  byte button_status;
-  String topic;
-  
-  if (mcp0GPIO != mcp0GPIO_old){  
-    //Send On/Off to specific button topic.
-    for (int i = 0; i < sizeof(lut)/2; i++) {
-      String topic_prefix = mqtt_button_prefix; //two step string build needed
-      topic = topic_prefix + i;
-      if ((mcp0GPIO^mcp0GPIO_old) & 1<<lut[i][0]){ //Check if specific button is changed
-        byte button_status = (mcp0GPIO&(1<<lut[i][0])) >> lut[i][0];
-        if (button_status == LOW) client.publish(topic.c_str(), "ON");
-        else client.publish(topic.c_str(), "OFF");   
-      }                
-    }
-  }
-  
-  if (mcp4GPIO != mcp4GPIO_old){
-    snprintf (mqttMsg, 250, "%d", mcp4GPIO);
-    client.publish(mqtt_GPIO_1, mqttMsg);
-  }
-  if (adsresult0 != adsresult0_old){
-    snprintf (mqttMsg, 250, "%d", adsresult0);
-    client.publish(mqtt_potmeter_0, mqttMsg);
-  }
-  if (adsresult1 != adsresult1_old){
-    snprintf (mqttMsg, 250, "%d", adsresult1);
-    client.publish(mqtt_potmeter_1, mqttMsg);
-  }
-}
-
-//Read and write User interface and send updates over MQTT
-int updateInputStatus(){
-  // Read Buttons
-  mcp0GPIO_old = mcp0GPIO;
-  mcp0GPIO = mcp0.readGPIOAB(); // read button status
-  mcp4.writeGPIOAB(mcp4GPIO);   // write to LEDs
-  //mcp4GPIO = mcp4.readGPIOAB(); // I believe they are the same...
-
-  // ADS1115 draaiknopjes, connected op ADS0 en ADS1 (single ended)
-  adsresult0_old = adsresult0;
-  adsresult1_old = adsresult1;
-  adsresult0 = int( ((adsresult0_old*(1-ADS_FILTER)) + (ads.readADC_SingleEnded(0)*ADS_FILTER))/17.5 ); //Some sort of filtering
-  adsresult1 = int( ((adsresult1_old*(1-ADS_FILTER)) + (ads.readADC_SingleEnded(1)*ADS_FILTER))/17.5 );
-
-  //if a button has been pressed, reset timeout timer
-  if (mcp0GPIO != mcp0GPIO_old){
-    lastButtonPressTime = millis();
-    mqttDebug("updateinput: button changed");
-    return 1;
-  }
-  else {
-    return 0; // no button presses
-  }
-}
-
-void gamePushMe(){
-  //while in game
-  
-  switch (pushMeState) {
-  case PUSHMERANDOMLIGHTS:
-    if (randomLights()) {
-      pushMeState = PUSHMESTART; //loop is done and continue
-      mqttDebug("PUSHMERANDOMLIGHTS: loop done go to PUSHMESTART");
-    }
-    break;
-    
-  case PUSHMESTART: //Start up new Game
-    target = random(10); //randomize button
-    gameStartTime = millis();
-    mcp4GPIO = 1<<lut[target][1]; //turn on only corresponding LED
-    mqttDebug("PUSHMESTART: begin");
-    if ( (mcp0GPIO&(1<<lut[target][0])) >> lut[target][0] == HIGH){ //check current status and save opposite
-      target_button_status = LOW;
-    }
-    else { 
-      target_button_status = HIGH;
-    }
-    
-    //Start waiting game
-    pushMeState = PUSHMEWAIT; //Go to next state
-    mqttDebug("PUSHMESTART: go to PUSHMEWAIT");
-
-    break;
-    
-  case PUSHMEWAIT: //Wait for button
-    if ( millis() - gameStartTime <= GAMETIMEWAITFORBUTTON){
-      if ((mcp0GPIO&(1<<lut[target][0])) >>lut[target][0] == target_button_status){
-        // correct button set to desired position
-        pushMeState = PUSHMERANDOMLIGHTS; //start new game
-        //mqttDebug("PUSHMEWAIT: button pressed ");
-        sprintf(debugmsg, "PUSHMEWAIT: button pressed after %d ms", (millis() - gameStartTime) ); mqttDebug(debugmsg);
-        snprintf (mqttMsg, 50, "%d", (millis() - gameStartTime));
-        client.publish(mqtt_reaction_time, mqttMsg);
-      }
-    }
-    else {
-      //timer passed
-        pushMeState = PUSHMERANDOMLIGHTS; //start new game
-        mqttDebug("PUSHMEWAIT: timer passed");
-    }
-    break;
-    
-  default:
-    // statements
-    break;
-  }
+  mqttDebug("Last button press timeout, going deepsleep");
+  delay(1000); // delay for updates?
+  //programState = OFFSTATE;
+  ESP.deepSleep(10*1000000, WAKE_RF_DEFAULT);
 }
 
 void loop() {
   int buttonsChanged;
-  
   buttonsChanged = updateInputStatus(); //Read and write once per loop
   
   //Only use wifi when not in OFFSTATE
@@ -436,6 +491,7 @@ void loop() {
      // OTA handles
     ArduinoOTA.handle();
     if (!client.connected()) {
+      setupWifi();
       reconnect();
     }
     client.loop();
@@ -450,7 +506,7 @@ void loop() {
     gamePushMe();
     break;
   case OFFSTATE:
-    mcp4GPIO = 0; // All LED off
+    
     //wifi_set_sleep_type(MODEM_SLEEP_T) // Modem off
     if (buttonsChanged) {
       mqttDebug("OFFSTATE: buttonschanged");
@@ -459,7 +515,9 @@ void loop() {
     }
     else {
       //mqttDebug("OFFSTATE: delay start");
-      delay(IDLEDELAY);
+      mqttDebug("OFFSTATE: going to DeepSleep 10s");
+      ESP.deepSleep(10*1000000, WAKE_RF_DEFAULT);
+      //delay(IDLEDELAY);
       //mqttDebug("OFFSTATE: delay end");
     }
     break;
@@ -470,8 +528,7 @@ void loop() {
   
   // timeout timer
   if ( (millis() - lastButtonPressTime) >= IDLETIMEOUT  && programState != OFFSTATE){
-    programState = OFFSTATE;
-    mqttDebug("Last button press timeout");
+    goDeepSleep();
   }
   
 }
